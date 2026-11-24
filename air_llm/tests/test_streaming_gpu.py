@@ -59,12 +59,29 @@ def run_airllm(args):
     return out.sequences[0].tolist()
 
 
+def _model_dtype(model_id):
+    """The model's native runtime dtype (bf16 for modern models).
+
+    The reference run must use the SAME dtype as the AirLLM run — AirLLM defaults to the
+    checkpoint's config.torch_dtype. Comparing fp16 vs bf16 produces token-level divergence
+    that has nothing to do with streaming correctness.
+    """
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_id)
+    dt = getattr(cfg, "torch_dtype", None)
+    if isinstance(dt, str):
+        dt = getattr(torch, dt, None)
+    return dt if isinstance(dt, torch.dtype) else torch.float16
+
+
 def run_reference(args):
     """Full-load run for correctness comparison (only feasible for small models)."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16).cuda().eval()
+    ref = AutoModelForCausalLM.from_pretrained(args.model, dtype=_model_dtype(args.model)).cuda().eval()
+    print(f"reference dtype: {ref.dtype}")
     ids = tok([args.prompt], return_tensors="pt", return_attention_mask=False)["input_ids"].cuda()
     out = ref.generate(ids, max_new_tokens=args.max_new_tokens, do_sample=False)
     text = tok.decode(out[0])

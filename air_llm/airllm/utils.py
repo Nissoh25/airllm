@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import re
 import ctypes
 import shutil
 from tqdm import tqdm
@@ -231,6 +232,23 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
             f"No model weights found under {checkpoint_path}. Expected one of: "
             f"model.safetensors(.index.json) or pytorch_model.bin(.index.json).")
 
+    # Composite VLM checkpoints (Qwen3.5-generation repos) store the text stack under
+    # 'model.language_model.' plus a 'model.visual.' tower and optional 'mtp.' heads, while the
+    # text-only causal model (what AutoModelForCausalLM builds) expects plain 'model.' prefixes
+    # and a top-level 'lm_head.'. Remap so the generic layer matcher sees the text stack and the
+    # vision tower / MTP heads are dropped from the stream.
+    if not any(k.startswith('model.layers.') or k.startswith('model.embed_tokens.') for k in index) \
+            and any(k.startswith('model.language_model.') for k in index):
+        print("composite VLM checkpoint detected: remapping 'model.language_model.' -> 'model.', "
+              "dropping vision tower and MTP heads")
+        remapped = {}
+        for k, v in index.items():
+            if k.startswith('model.language_model.'):
+                remapped['model.' + k[len('model.language_model.'):]] = v
+            elif 'visual' not in k and not k.startswith('mtp.'):
+                remapped[k] = v
+        index = remapped
+
     if layer_names is None:
         n_layers = len(set([int(k.split('.')[2]) for k in index.keys() if 'model.layers' in k]))
     else:
@@ -279,43 +297,60 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
 
     # Map shard ordinal -> actual checkpoint filename, taken straight from the index. We must NOT
     # reconstruct names like f"model-000{n:02d}-of-000{n_shards:02d}.safetensors": repos differ in
-    # zero-padding width (e.g. DeepSeek uses model-00001-of-000004.safetensors) and in extension.
+    # zero-padding width (e.g. DeepSeek uses model-00001-of-000004.safetensors), in extension, and
+    # in scheme entirely (Qwen3.5-generation repos use 'layers-0.safetensors', 0-based, no -of-).
+    def _shard_ordinal(fname):
+        m = re.search(r"-(\d+)-of-", fname)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"-(\d+)\.\w+$", fname)  # layers-0.safetensors / model-0.safetensors
+        if m:
+            return int(m.group(1))
+        m = re.search(r"-(\d+)$", fname)
+        if m:
+            return int(m.group(1))
+        return None
+
     shard_num_to_file = {}
     for v in set(index.values()):
-        parts = v.split('-')
-        if len(parts) > 1:
-            try:
-                shard_num_to_file[int(parts[1])] = v
-            except ValueError:
-                pass
+        o = _shard_ordinal(v)
+        if o is not None:
+            shard_num_to_file[o] = v
 
     if not os.path.exists(saving_path):
         #os.makedirs(saving_path)
         saving_path.mkdir(parents=True, exist_ok=True)
 
     single_modelfile = None
+    loaded_shards = set()
+    prev_loaded_ordinal = None
 
     for layer in tqdm(layers):
 
         # Optionnally load next shard
         # checking whether after spliting from '-', if second element exists. otherwise it throws errors for single 'model.safetensor' files
-        shards = [int(v.split('-')[1]) for k, v in index.items() if k.startswith(layer) and '-' in v and len(v.split('-')) > 1]
-        if len(shards) > 0:
+        layer_ords = sorted({_shard_ordinal(v) for k, v in index.items()
+                             if k.startswith(layer) and _shard_ordinal(v) is not None})
+        if len(layer_ords) > 0:
             # A layer can span several shards (especially fp8 checkpoints, where each weight has a
-            # companion weight_scale_inv tensor). Load *every* shard up to the highest one this layer
-            # references, not just the next one -- otherwise the layer is saved missing some tensors
-            # (e.g. the block scales), which silently corrupts fp8 weights.
-            while max(shards) > shard:
+            # companion weight_scale_inv tensor). Load *every* shard this layer references -- not
+            # just one -- otherwise the layer is saved missing some tensors (e.g. the block scales),
+            # which silently corrupts fp8 weights. Ordinals are explicit, so 0-based ('layers-N')
+            # and 1-based ('model-XXX-of-YYY') naming both work.
+            for o in layer_ords:
+                if o in loaded_shards:
+                    continue
                 # optionally delete the original file we're done with (its tensors are already in RAM)
-                if delete_original and shard != 0:
-                    to_delete = checkpoint_path / shard_num_to_file[shard]
+                if delete_original and prev_loaded_ordinal is not None:
+                    to_delete = checkpoint_path / shard_num_to_file[prev_loaded_ordinal]
 
                     print(f"deleting original file: {to_delete}")
                     remove_real_and_linked_file(to_delete)
-                shard += 1
-                print(f'Loading shard {shard}/{n_shards}')
+                loaded_shards.add(o)
+                prev_loaded_ordinal = o
+                print(f'Loading shard {o} (checkpoint files: {len(shard_num_to_file)})')
 
-                to_load = checkpoint_path / shard_num_to_file[shard]
+                to_load = checkpoint_path / shard_num_to_file[o]
 
                 # check if to_load exist, if not downloaad it...
                 if not os.path.exists(to_load):

@@ -25,6 +25,33 @@ except ImportError:
     bitsandbytes_installed = False
 
 
+# ---- transformers meta-device compatibility (2026-11-24) ----------------------------------
+# AirLLM keeps the full model skeleton on the meta device between layer executions.
+# transformers' mask builders (sdpa_mask / flex attention) probe mask CONTENT with scalar
+# ops like `padding_mask.all()` to decide whether the causal fast-path applies. Scalar ops
+# are illegal on meta tensors ("Tensor.item() cannot be called on meta tensors"), so such a
+# probe crashes the forward. A meta mask can only be the default all-True padding mask built
+# during meta-init (real user masks are always created on a concrete device), and an
+# all-True mask is exactly the "no padding" case, which is also what `padding_mask=None`
+# means to those probes. So we substitute None for meta masks inside the two probes.
+try:
+    import transformers.masking_utils as _masking_utils
+
+    def _meta_safe(orig):
+        def wrapper(padding_mask, *args, **kwargs):
+            if padding_mask is not None and getattr(padding_mask, 'device', None) is not None \
+                    and padding_mask.device.type == 'meta':
+                padding_mask = None
+            return orig(padding_mask, *args, **kwargs)
+        return wrapper
+
+    _masking_utils._ignore_causal_mask_sdpa = _meta_safe(_masking_utils._ignore_causal_mask_sdpa)
+    _masking_utils._ignore_bidirectional_mask_sdpa = _meta_safe(_masking_utils._ignore_bidirectional_mask_sdpa)
+except (ImportError, AttributeError):
+    pass
+# ----------------------------------------------------------------------------------------------
+
+
 class AirLLMBaseModel:
     """
     Memory-frugal wrapper around a Hugging Face ``*ForCausalLM`` model.
@@ -194,7 +221,12 @@ class AirLLMBaseModel:
                     self.config, attn_implementation="eager", trust_remote_code=self.trust_remote_code)
 
         quantization_config = getattr(self.config, "quantization_config", None)
-        if quantization_config is not None:
+        # Pre-quantized FP8 (qwen3_5-style checkpoints): the finegrained-fp8 hub kernel hits
+        # CUDA IMA on this build; the working path dequants each layer to the running dtype at
+        # stream time (see move_layer_to_device). Skip the quantizer so weights go through the
+        # plain placement branch. Other pre-quantized schemes (gptq/bnb) keep the quantizer path.
+        if quantization_config is not None and \
+                str(getattr(quantization_config, "quant_method", "")).lower() != "fp8":
             self.hf_quantizer = AutoHfQuantizer.from_config(quantization_config, pre_quantized=True)
             device_map = self.hf_quantizer.update_device_map(None)
             self.hf_quantizer.preprocess_model(model=self.model, device_map=device_map)
@@ -278,22 +310,24 @@ class AirLLMBaseModel:
     def move_layer_to_device(self, state_dict):
         moved = []
         for param_name in self._param_names_from_state_dict(state_dict):
+            # fp8 block scales: only meaningful for in-place fp8 compute, which is broken on this
+            # build (Triton IMA); weights are dequanted to the running dtype at stream time instead.
+            if param_name.endswith("_scale_inv"):
+                continue
             if self.hf_quantizer is not None and self._needs_quantization(param_name):
                 # On-the-fly-quantizing schemes (e.g. bitsandbytes) reconstruct the param from the
                 # weight plus companion quant-state tensors carried in state_dict.
                 self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name,
                                                          self.running_device, state_dict)
             else:
-                # Normal load. Pre-quantized weights (fp8) and their block scales must be placed
-                # verbatim: casting an fp8 weight to fp16 silently drops the quantization and the
-                # accompanying weight_scale_inv, producing garbage. Only ordinary high-precision
-                # tensors get cast to the runtime dtype.
+                # FP8 pre-quantized weights: dequant (cast) to the running dtype at stream time.
+                # The on-disk shard stays fp8 (memory compression); the forward pass runs in the
+                # running dtype, which is what transformers' native model code expects.
                 value = state_dict[param_name]
-                if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or param_name.endswith("_scale_inv"):
-                    set_module_tensor_to_device(self.model, param_name, self.running_device, value=value)
-                else:
-                    set_module_tensor_to_device(self.model, param_name, self.running_device,
-                                                value=value, dtype=self.running_dtype)
+                if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    value = value.to(self.running_dtype)
+                set_module_tensor_to_device(self.model, param_name, self.running_device,
+                                            value=value, dtype=self.running_dtype)
             moved.append(param_name)
         return moved
 

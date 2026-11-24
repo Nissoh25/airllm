@@ -23,13 +23,15 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/lyogavin/airllm",
-    packages=setuptools.find_packages(),
+    packages=setuptools.find_packages(exclude=["tests", "tests.*"]),
     # Keep the dependency surface small and pinned to a tested range so a plain
     # `pip install airllm` gives users a known-good stack with no manual upgrades.
     install_requires=[
         'tqdm',
         'torch>=2.4',
-        'transformers>=4.49,<5.13',
+        # Qwen3 (this project's flagship target) first shipped in transformers 4.51; anything
+        # older fails with "model type `qwen3` not recognized" at load time.
+        'transformers>=4.51,<5.13',
         'accelerate>=1.0',
         'safetensors',
         'huggingface-hub',

@@ -15,6 +15,11 @@ else:
     from .auto_model import AutoModel
     from .utils import split_and_save_layers
     from .utils import NotEnoughSpaceException
+    # Public compression helpers (used by the test-suite and by users who want to
+    # quantize a layer dict themselves).
+    from .utils import load_layer
+    from .utils import compress_layer_state_dict
+    from .utils import uncompress_layer_state_dict
 
     # Dedicated subclasses for a handful of custom-architecture models. Some of them pull in
     # optional extras (e.g. the Baichuan tokenizer needs `sentencepiece`). Import them defensively
