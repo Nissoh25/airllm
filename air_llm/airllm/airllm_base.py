@@ -320,12 +320,39 @@ class AirLLMBaseModel:
                 self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name,
                                                          self.running_device, state_dict)
             else:
-                # FP8 pre-quantized weights: dequant (cast) to the running dtype at stream time.
+                # FP8 pre-quantized weights: dequant to the running dtype at stream time.
                 # The on-disk shard stays fp8 (memory compression); the forward pass runs in the
                 # running dtype, which is what transformers' native model code expects.
                 value = state_dict[param_name]
                 if value.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                    value = value.to(self.running_dtype)
+                    # SPARK-PATCH 2026-11-24: block-quantized FP8 (compressed-tensors layout)
+                    # carries a companion "<name>_scale_inv" of shape [R//br, C//bc]. A plain
+                    # f8->bf16 cast silently yields wrong values (raw codes, no scaling), so
+                    # apply the block scale on CPU (source is pinned) before the device move.
+                    scale = state_dict.get(param_name + '_scale_inv')
+                    if scale is not None and scale.numel() > 1:
+                        r, c = value.shape
+                        sr, sc = scale.shape
+                        # SPARK-PATCH 2026-11-24 (v2): dequant on the TARGET device when it is
+                        # CUDA. The CPU path (value.float() -> f32 temp) cost ~20s/layer on GB10
+                        # because 1.5GiB of f32 view+scale-broadcast runs at DRAM bandwidth on
+                        # the CPU; on the Blackwell GPU the same op is ~100x faster and the
+                        # 1.9GiB transient fits the unified pool. CPU fallback kept for
+                        # non-CUDA running devices.
+                        if str(self.running_device).startswith('cuda'):
+                            dev = torch.device(self.running_device)
+                            w = value.to(dev, non_blocking=True)
+                            s = scale.to(dev, non_blocking=True)
+                            w = w.float().view(sr, r // sr, sc, c // sc)
+                            w = w * s.float().view(sr, 1, sc, 1)
+                            value = w.view(r, c).to(self.running_device, self.running_dtype)
+                            del w, s
+                        else:
+                            w = value.float().view(sr, r // sr, sc, c // sc)
+                            w = w * scale.float().view(sr, 1, sc, 1)
+                            value = w.view(r, c).to(self.running_dtype)
+                    else:
+                        value = value.to(self.running_dtype)
                 set_module_tensor_to_device(self.model, param_name, self.running_device,
                                             value=value, dtype=self.running_dtype)
             moved.append(param_name)
