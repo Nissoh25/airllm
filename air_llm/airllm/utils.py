@@ -80,7 +80,8 @@ def clean_memory():
     except Exception as ex:
         # maybe platform
         pass
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()  # SPARK-PATCH 2026-11-24: UMA GB10 — no CUDA ctx alloc when running CPU lane
 
 
 def uncompress_layer_state_dict(layer_state_dict):
@@ -237,8 +238,10 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
     # text-only causal model (what AutoModelForCausalLM builds) expects plain 'model.' prefixes
     # and a top-level 'lm_head.'. Remap so the generic layer matcher sees the text stack and the
     # vision tower / MTP heads are dropped from the stream.
+    vlm_composite = False  # SPARK-PATCH 2026-11-25: set when the index needed the VLM text-stack remap
     if not any(k.startswith('model.layers.') or k.startswith('model.embed_tokens.') for k in index) \
             and any(k.startswith('model.language_model.') for k in index):
+        vlm_composite = True
         print("composite VLM checkpoint detected: remapping 'model.language_model.' -> 'model.', "
               "dropping vision tower and MTP heads")
         remapped = {}
@@ -378,7 +381,23 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
                 state_dict.update(load_file(to_load, device='cpu'))
 
         # Get layer state dict
-        layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
+        # SPARK-PATCH 2026-11-25 (VLM split fix v2): the index keys were remapped above, but the
+        # raw safetensors keys still carry 'model.language_model.' -- a plain startswith(layer)
+        # match finds nothing and every layer shard is written EMPTY (16-byte files + .done
+        # markers; generation later crashes on meta tensors). Match AND store under the remapped
+        # name: the runtime skeleton is the text-only CausalLM (Qwen3_5TextModel), whose params
+        # are the plain 'model.layers.N.*' names -- proven by spark1's working splitted_model/
+        # shards, which all carry plain keys.
+        if vlm_composite:
+            _pfx = 'model.language_model.'
+            _pairs = [(('model.' + k[len(_pfx):]) if k.startswith(_pfx) else k, k, v)
+                      for k, v in state_dict.items()]
+            _hit = [(rk, k, v) for rk, k, v in _pairs if rk.startswith(layer)]
+            layer_state_dict = {rk: v for rk, k, v in _hit}
+            _consumed = [k for rk, k, v in _hit]
+        else:
+            layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
+            _consumed = list(layer_state_dict.keys())
 
         layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
 
@@ -388,8 +407,8 @@ def split_and_save_layers(checkpoint_path, layer_shards_saving_path=None, splitt
         if not marker_exists:
             ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
 
-        # Free memory
-        for k in layer_state_dict.keys():
+        # Free memory (SPARK-PATCH 2026-11-25: by ORIGINAL keys -- stored keys may be remapped)
+        for k in _consumed:
             if k in state_dict:
                 del state_dict[k]
         del layer_state_dict

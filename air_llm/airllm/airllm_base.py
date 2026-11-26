@@ -301,7 +301,7 @@ class AirLLMBaseModel:
         else:
             state_dict = load_layer_output
 
-        if self.prefetching and torch.cuda.is_available():
+        if self.prefetching and str(self.running_device).startswith("cuda") and torch.cuda.is_available():  # SPARK-PATCH UMA: pin_memory allocates CUDA ctx — CPU lane must skip
             for k in state_dict.keys():
                 state_dict[k].pin_memory()
 
